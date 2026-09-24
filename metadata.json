@@ -1,0 +1,6 @@
+{
+  "name": "MmapLLM",
+  "description": "Zero-RAM local LLM inference engine using memory-mapped GGUF files and dynamic context paging.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">MmapLLM</string>
+    <string name="title_engine">Mmap Engine</string>
+    <string name="title_models">Model Hub</string>
+    <string name="title_memory">RAM Monitor</string>
+    <string name="title_settings">Settings</string>
+</resources>
