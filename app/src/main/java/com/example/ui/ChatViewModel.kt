@@ -257,7 +257,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Loads a GGUF file from URI. Strictly rejects non-GGUF files!
+     * Loads a GGUF file from URI. Strictly validates GGUF magic bytes and mounts zero-copy.
      */
     fun loadModelFromUri(uri: Uri) {
         viewModelScope.launch {
@@ -265,62 +265,132 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             withContext(Dispatchers.IO) {
                 val app = getApplication<Application>()
                 var fileName = "custom_model.gguf"
-                app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex >= 0 && cursor.moveToFirst()) {
-                        fileName = cursor.getString(nameIndex)
-                    }
-                }
+                var fileSizeBytes = 0L
 
-                // Strict extension check
-                if (!fileName.endsWith(".gguf", ignoreCase = true)) {
-                    _statusBanner.value = "Error: Only .gguf files are supported! Rejected '$fileName'."
-                    return@withContext
+                try {
+                    app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                        if (cursor.moveToFirst()) {
+                            if (nameIndex >= 0) fileName = cursor.getString(nameIndex) ?: fileName
+                            if (sizeIndex >= 0) fileSizeBytes = cursor.getLong(sizeIndex)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not query cursor for URI: ${e.message}")
                 }
 
                 try {
-                    // Check magic bytes directly from stream before copying
+                    // 1. Check GGUF magic bytes directly from stream before any heavy operation
+                    var isMagicValid = false
+                    var magicStr = ""
                     app.contentResolver.openInputStream(uri)?.use { stream ->
                         val magic = ByteArray(4)
                         val read = stream.read(magic)
-                        val magicStr = String(magic, 0, maxOf(0, read), Charsets.US_ASCII)
-                        if (magicStr != "GGUF") {
-                            _statusBanner.value = "Rejected: File '$fileName' is not a valid GGUF file (Magic: $magicStr)."
+                        magicStr = String(magic, 0, maxOf(0, read), Charsets.US_ASCII)
+                        isMagicValid = (magicStr == "GGUF")
+                    }
+
+                    if (!isMagicValid) {
+                        _statusBanner.value = "Rejected: File '$fileName' is not a valid GGUF file (Magic: '$magicStr')."
+                        return@withContext
+                    }
+
+                    // 2. Try zero-copy direct mount if file is already on local storage
+                    val directFile = tryResolveDirectFile(app, uri)
+                    val activeFile: File
+
+                    if (directFile != null && directFile.exists() && directFile.canRead()) {
+                        Log.i(TAG, "Zero-copy direct mount from flash: ${directFile.absolutePath}")
+                        activeFile = directFile
+                    } else {
+                        // 3. Fallback: Copy to app's model repository with progress updates
+                        val modelsDir = File(app.filesDir, "models")
+                        if (!modelsDir.exists()) modelsDir.mkdirs()
+
+                        val safeName = if (fileName.endsWith(".gguf", ignoreCase = true)) fileName else "$fileName.gguf"
+                        val targetFile = File(modelsDir, safeName)
+
+                        val freeSpace = app.filesDir.usableSpace
+                        if (fileSizeBytes > 0 && freeSpace < fileSizeBytes + 50_000_000L) {
+                            _statusBanner.value = "Storage Full: Need ${fileSizeBytes / (1024 * 1024)} MB, only ${freeSpace / (1024 * 1024)} MB free."
                             return@withContext
                         }
-                    }
 
-                    val targetFile = File(File(app.filesDir, "models"), fileName)
-                    targetFile.parentFile?.mkdirs()
-                    app.contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(targetFile).use { output ->
-                            input.copyTo(output)
+                        app.contentResolver.openInputStream(uri)?.use { input ->
+                            FileOutputStream(targetFile).use { output ->
+                                val buffer = ByteArray(64 * 1024)
+                                var copied = 0L
+                                var read: Int
+                                var lastUpdate = System.currentTimeMillis()
+
+                                while (input.read(buffer).also { read = it } != -1) {
+                                    output.write(buffer, 0, read)
+                                    copied += read
+
+                                    val now = System.currentTimeMillis()
+                                    if (now - lastUpdate >= 300) {
+                                        val percent = if (fileSizeBytes > 0) (copied * 100 / fileSizeBytes).toInt() else 0
+                                        val mbCopied = copied / (1024 * 1024)
+                                        _statusBanner.value = "Importing GGUF: $percent% ($mbCopied MB)..."
+                                        lastUpdate = now
+                                    }
+                                }
+                                output.flush()
+                            }
                         }
+                        activeFile = targetFile
                     }
 
-                    val result = engine.loadModel(targetFile)
+                    _statusBanner.value = "Verifying GGUF architecture: ${activeFile.name}..."
+
+                    val result = engine.loadModel(activeFile)
                     result.onSuccess { meta ->
                         _activeMetadata.value = meta
                         repository.addCustomModel(
                             name = meta.modelName,
-                            filePath = targetFile.absolutePath,
-                            fileSizeBytes = targetFile.length(),
+                            filePath = activeFile.absolutePath,
+                            fileSizeBytes = activeFile.length(),
                             architecture = meta.architecture,
                             quantType = meta.primaryQuantType.description,
                             contextLimit = meta.contextLength
                         )
-                        _statusBanner.value = "Loaded ${meta.modelName} [${meta.architecture}] (${meta.primaryQuantType.name}). 0 MB heap!"
+                        _statusBanner.value = "Loaded ${meta.modelName} [${meta.architecture}] (${meta.primaryQuantType.name}). Zero-copy mapped!"
                         scanStorageModels()
                     }.onFailure { err ->
-                        _statusBanner.value = "GGUF Error: ${err.message}"
+                        Log.e(TAG, "GGUF validation failed", err)
+                        _statusBanner.value = "GGUF Error: ${err.localizedMessage ?: "Invalid structure"}"
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error importing GGUF from URI", e)
-                    _statusBanner.value = "Import Failed: ${e.message}"
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Error importing GGUF from URI", t)
+                    _statusBanner.value = "Import Failed: ${t.localizedMessage ?: t.javaClass.simpleName}"
                 }
             }
             refreshMemoryMetrics()
         }
+    }
+
+    private fun tryResolveDirectFile(context: android.content.Context, uri: Uri): File? {
+        if (uri.scheme == "file") {
+            val f = File(uri.path ?: return null)
+            if (f.exists() && f.canRead()) return f
+        }
+        try {
+            val path = uri.path ?: ""
+            if (path.contains("primary:")) {
+                val rel = path.substringAfter("primary:")
+                val extDir = android.os.Environment.getExternalStorageDirectory()
+                val candidate = File(extDir, rel)
+                if (candidate.exists() && candidate.canRead()) return candidate
+            }
+            if (path.contains("raw:")) {
+                val candidate = File(path.substringAfter("raw:"))
+                if (candidate.exists() && candidate.canRead()) return candidate
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Direct path resolution failed: ${e.message}")
+        }
+        return null
     }
 
     /**
