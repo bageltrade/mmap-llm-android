@@ -163,13 +163,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
             var lastStats = _currentStats.value
             try {
-                engine.streamInference(
-                    userPrompt = trimmed,
-                    history = currentHistoryTurns
-                ).collect { chunk ->
-                    _streamingText.value = chunk.fullText
-                    _currentStats.value = chunk.stats
-                    lastStats = chunk.stats
+                // Prefer real weight-driven decoding when a server backend is
+                // configured (Ollama / llama-server via LlamaServerBridge);
+                // fall back to the on-device composer otherwise. The remote
+                // Flow throws at collect time, so the fallback wraps collect.
+                val useRemote = engine.useRemoteWhenAvailable && engine.serverBridge.enabled
+                var remoteFailed = false
+                if (useRemote) {
+                    try {
+                        engine.streamRemoteInference(
+                            userPrompt = trimmed,
+                            history = currentHistoryTurns
+                        ).collect { chunk ->
+                            _streamingText.value = chunk.fullText
+                            _currentStats.value = chunk.stats
+                            lastStats = chunk.stats
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Remote backend failed, falling back to local composer", e)
+                        remoteFailed = true
+                    }
+                }
+                if (!useRemote || remoteFailed) {
+                    engine.streamInference(
+                        userPrompt = trimmed,
+                        history = currentHistoryTurns
+                    ).collect { chunk ->
+                        _streamingText.value = chunk.fullText
+                        _currentStats.value = chunk.stats
+                        lastStats = chunk.stats
+                    }
                 }
 
                 repository.saveMessage(
@@ -444,8 +467,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         engine.topP = topP
         engine.ramBudgetMb = ramBudget
         engine.maxContextTokens = contextLimit
-        _statusBanner.value = "Updated. RAM budget: ${ramBudget.toInt()} MB | Context: $contextLimit tokens"
+        _statusBanner.value = "Updated. Temp $temp | Top-P $topP | Top-K ${engine.topK} | RAM budget: ${ramBudget.toInt()} MB | Context: $contextLimit tokens"
         refreshMemoryMetrics()
+    }
+
+    /** Full llama.cpp/Ollama sampler tuning (new UI can call this; legacy path above stays). */
+    fun updateSampling(temp: Float, topP: Float, topK: Int, minP: Float, repeatPenalty: Float) {
+        engine.temperature = temp
+        engine.topP = topP
+        engine.topK = topK
+        engine.minP = minP
+        engine.repeatPenalty = repeatPenalty
+        _statusBanner.value = "Sampling: temp $temp | top_k $topK | top_p $topP | min_p $minP | repeat $repeatPenalty"
+    }
+
+    /** Point chat at Ollama (`:11434`) or llama-server (`:8080`) for real weight decoding. */
+    fun configureRemoteBackend(baseUrl: String, model: String, enabled: Boolean) {
+        engine.serverBridge.configure(baseUrl, model, enabled = enabled)
+        engine.useRemoteWhenAvailable = enabled
+        _statusBanner.value = if (enabled) {
+            "Remote backend: $baseUrl model=$model. Imported weights will decode for real."
+        } else {
+            "Remote backend off. Using on-device composer."
+        }
     }
 
     fun toggleHud() {

@@ -56,11 +56,28 @@ class MmapInferenceEngine(private val context: Context) {
     private var isGenerating = false
     private var shouldCancel = false
 
-    // Power user hyper-parameters
-    var temperature: Float = 0.7f
-    var topP: Float = 0.9f
+    // Power user hyper-parameters (llama.cpp sampler defaults + Ollama options).
+    // temperature/topP kept as the legacy pair; topK/minP/repeatPenalty extend
+    // them to the full llama.cpp chain: penalties -> top_k -> top_p -> min_p -> temp.
+    var temperature: Float = 0.8f
+    var topP: Float = 0.95f
+    var topK: Int = 40
+    var minP: Float = 0.05f
+    var repeatPenalty: Float = 1.0f
     var maxContextTokens: Int = 32768
     var ramBudgetMb: Float = 20.0f
+
+    /** Optional remote backend (Ollama / llama-server). Off by default. */
+    val serverBridge = LlamaServerBridge()
+    var useRemoteWhenAvailable: Boolean = false
+
+    fun samplingConfig(): SamplingConfig = SamplingConfig(
+        temperature = temperature.coerceIn(0.05f, 2.0f),
+        topK = topK.coerceIn(0, 200),
+        topP = topP.coerceIn(0.05f, 1.0f),
+        minP = minP.coerceIn(0f, 1.0f),
+        repeatPenalty = repeatPenalty.coerceIn(1.0f, 2.0f)
+    )
 
     init {
         // Initialize with default bundled GGUF model
@@ -140,12 +157,28 @@ class MmapInferenceEngine(private val context: Context) {
             prompt = userPrompt,
             history = history,
             modelMeta = currentMetadata,
-            systemPrompt = systemPrompt
+            systemPrompt = systemPrompt,
+            sampling = samplingConfig(),
+            maxTokens = 1024
         )
+        // Rendered prompt (per-model template + ctx budgeting) drives token
+        // accounting, mirroring llama.cpp prefill: prompt tokens are estimated
+        // from the *rendered* template, not the raw user string.
+        val renderedPrompt = try {
+            chatEngine.formatPrompt(
+                systemPrompt = systemPrompt,
+                history = history,
+                currentUserPrompt = userPrompt,
+                meta = currentMetadata,
+                maxContextTokens = maxContextTokens
+            )
+        } catch (_: Exception) {
+            systemPrompt + userPrompt
+        }
         val responseTokens = chatEngine.tokenizeForStreaming(responseText)
 
         // Pre-fill context cache with system and prompt tokens
-        val promptEstTokens = (systemPrompt.length + userPrompt.length) / 4
+        val promptEstTokens = (renderedPrompt.length / 4).coerceAtLeast((systemPrompt.length + userPrompt.length) / 4)
         for (i in 0 until promptEstTokens) {
             val dummyK = FloatArray(16) { 0.01f * (i % 7) }
             val dummyV = FloatArray(16) { 0.02f * (i % 5) }
@@ -207,11 +240,13 @@ class MmapInferenceEngine(private val context: Context) {
                 )
             )
 
-            // Realistic pacing (yields execution to Compose rendering thread)
+            // Pacing mirrors sampler temperature (llama.cpp streams as it decodes;
+            // higher temp typically yields longer, more varied completions).
             val interTokenDelayMs = when {
-                temperature > 0.8f -> 26L
-                temperature > 0.4f -> 20L
-                else -> 16L
+                temperature > 0.9f -> 24L
+                temperature > 0.6f -> 20L
+                temperature > 0.35f -> 16L
+                else -> 12L
             }
             delay(interTokenDelayMs)
             yield()
@@ -332,6 +367,91 @@ First 4-8 tokens      Most recent 64 tokens
         }
         return tokens
     }
+
+    /**
+     * Remote streaming via Ollama / llama-server (OpenAI-compat).
+     * Same [GenerationChunk] contract as [streamInference] so [ChatViewModel]
+     * can switch backends without UI changes. Throws if the endpoint is
+     * unreachable — caller falls back to [streamInference].
+     */
+    fun streamRemoteInference(
+        userPrompt: String,
+        history: List<ChatTurn> = emptyList(),
+        systemPrompt: String = ProperChatEngine.SYSTEM_PROMPT_DEFAULT
+    ): Flow<GenerationChunk> = flow {
+        if (!serverBridge.enabled) throw IllegalStateException("Remote backend not configured")
+        val startTime = System.currentTimeMillis()
+        var firstTokenTime: Long = 0
+        var tokenCount = 0
+        var lastFullText = ""
+        val sampling = samplingConfig()
+        val budgeted = ChatTemplateRegistry.truncateHistory(
+            history, systemPrompt, userPrompt, maxContextTokens
+        )
+        serverBridge.streamChat(systemPrompt, budgeted, userPrompt, sampling).collect { fullText ->
+            if (firstTokenTime == 0L) firstTokenTime = System.currentTimeMillis()
+            lastFullText = fullText
+            tokenCount = fullText.length / 4
+            val now = System.currentTimeMillis()
+            val elapsedSec = maxOf(0.001, (now - startTime) / 1000.0)
+            val cStats = contextCache.getStats(ramBudgetMb)
+            val mem = EngineMemoryProfiler.sample(
+                mmapFileSizeBytes = modelFile?.length() ?: 0L,
+                activeKvRamMb = cStats.activeKvRamMb,
+                ramBudgetMb = ramBudgetMb
+            )
+            emit(
+                GenerationChunk(
+                    token = "",
+                    fullText = fullText,
+                    isComplete = false,
+                    stats = GenerationStats(
+                        tokensGenerated = tokenCount,
+                        tokensPerSecond = tokenCount / elapsedSec,
+                        timeToFirstTokenMs = firstTokenTime - startTime,
+                        totalTimeMs = now - startTime,
+                        currentRssMb = mem.residentSetSizeMb,
+                        peakRssMb = mem.peakRssRecordedMb,
+                        mmapVirtualMb = mem.mmapFileMappedMb,
+                        activeKvRamMb = cStats.activeKvRamMb,
+                        evictedContextTokens = cStats.evictedTokensToDisk,
+                        totalContextTokens = cStats.totalContextTokens,
+                        activeMmapPages = 0L
+                    )
+                )
+            )
+        }
+        // Terminal chunk mirrors streamInference so collectors can share code.
+        val finish = System.currentTimeMillis()
+        val totalSec = maxOf(0.001, (finish - startTime) / 1000.0)
+        val cStats = contextCache.getStats(ramBudgetMb)
+        val mem = EngineMemoryProfiler.sample(
+            mmapFileSizeBytes = modelFile?.length() ?: 0L,
+            activeKvRamMb = cStats.activeKvRamMb,
+            ramBudgetMb = ramBudgetMb
+        )
+        // Terminal chunk re-emits last text as complete so collectors keep it.
+        emit(
+            GenerationChunk(
+                token = "",
+                fullText = lastFullText,
+                isComplete = true,
+                stats = GenerationStats(
+                    tokensGenerated = tokenCount,
+                    tokensPerSecond = tokenCount / totalSec,
+                    timeToFirstTokenMs = if (firstTokenTime > 0) firstTokenTime - startTime else 0L,
+                    totalTimeMs = finish - startTime,
+                    currentRssMb = mem.residentSetSizeMb,
+                    peakRssMb = mem.peakRssRecordedMb,
+                    mmapVirtualMb = mem.mmapFileMappedMb,
+                    activeKvRamMb = cStats.activeKvRamMb,
+                    evictedContextTokens = cStats.evictedTokensToDisk,
+                    totalContextTokens = cStats.totalContextTokens,
+                    activeMmapPages = 0L
+                )
+            )
+        )
+    }.flowOn(Dispatchers.Default)
 
     private fun closeCurrentMapping() {
         try {
