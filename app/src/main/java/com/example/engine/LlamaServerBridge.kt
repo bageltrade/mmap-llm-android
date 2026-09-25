@@ -91,13 +91,13 @@ class LlamaServerBridge(
     suspend fun probe(): Boolean = try {
         val req = Request.Builder().url("$baseUrl/api/tags").get().build()
         client.newCall(req).execute().use { it.isSuccessful }
-    } catch (_: Exception) {
+    } catch (_e: Exception) {
         try {
             val req = Request.Builder().url("$baseUrl/v1/models").apply {
                 apiKey?.let { header("Authorization", "Bearer $it") }
             }.get().build()
             client.newCall(req).execute().use { it.isSuccessful }
-        } catch (_: Exception) { false }
+        } catch (_e: Exception) { false }
     }
 
     /**
