@@ -539,7 +539,7 @@ export function useSearch(query: string, delay = 300) {
   React.useEffect(() => {
     const ctrl = new AbortController();
     const t = setTimeout(async () => {
-      const res = await fetch(`/api/search?q=${encodeURIComponent(query)}`, { signal: ctrl.signal });
+      const res = await fetch(`/api/search?q=${'$'}{encodeURIComponent(query)}`, { signal: ctrl.signal });
       setData(await res.json());
     }, delay);
     return () => { clearTimeout(t); ctrl.abort(); };
