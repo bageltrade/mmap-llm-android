@@ -294,11 +294,16 @@ Name a language plus the task (e.g. "Kotlin Flow retry with backoff") and I will
             if (ops.isEmpty() || values.size < 2) return false
             val op = ops.removeLast()
             val b = values.removeLast(); val a = values.removeLast()
-            values.addLast(when (op) {
-                "+" -> a + b; "-" -> a - b; "*" -> a * b
-                "/" -> { if (b == 0.0) return false; a / b }()
-                "%" -> a % b; "**" -> a.pow(b); else -> return false
-            })
+            val res: Double = when (op) {
+                "+" -> a + b
+                "-" -> a - b
+                "*" -> a * b
+                "/" -> if (b == 0.0) return false else a / b
+                "%" -> a % b
+                "**" -> a.pow(b)
+                else -> return false
+            }
+            values.addLast(res)
             return true
         }
         var i = 0
