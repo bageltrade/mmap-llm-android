@@ -18,7 +18,7 @@ package com.example.engine
 object ChatTemplateRegistry {
 
     enum class TemplateId {
-        CHATML, LLAMA3, LLAMA2, GEMMA, DEEPSEEK_R1, QWEN3, PHI4, MISTRAL, FALCON, GENERIC
+        CHATML, LLAMA3, LLAMA2, GEMMA, DEEPSEEK_R1, QWEN3, QWEN_THINK, PHI4, MISTRAL, FALCON, GENERIC
     }
 
     fun detectTemplate(meta: GgufMetadata?): TemplateId {
@@ -26,11 +26,16 @@ object ChatTemplateRegistry {
         val raw = meta?.rawMetadata?.get("tokenizer.chat_template")?.toString()?.lowercase() ?: ""
         if (raw.isNotEmpty()) {
             when {
-                "deepseek" in raw || "<think>" in raw -> return TemplateId.DEEPSEEK_R1
+                // DeepSeek-V3/R1 templates use fullwidth sentence markers; bare
+                // <think> alone also appears in Qwen3-family templates, so it
+                // must NOT imply DeepSeek (verified against a qwen35 GGUF whose
+                // template contains <think> inside ChatML structure).
+                "deepseek" in raw || "\uFF5Cbegin\u2581of\u2581sentence\uFF5C" in raw -> return TemplateId.DEEPSEEK_R1
                 "llama-3" in raw || "llama3" in raw || "<|start_header_id|>" in raw -> return TemplateId.LLAMA3
                 "gemma" in raw || "<start_of_turn>" in raw -> return TemplateId.GEMMA
                 "mistral" in raw || "[inst]" in raw -> return TemplateId.MISTRAL
                 "phi" in raw -> return TemplateId.PHI4
+                "<|im_start|>" in raw && "<think>" in raw -> return TemplateId.QWEN_THINK
                 "im_start" in raw || "chatml" in raw -> return TemplateId.CHATML
             }
         }
@@ -45,6 +50,9 @@ object ChatTemplateRegistry {
             "mistral" in hay || "mixtral" in hay -> TemplateId.MISTRAL
             "phi" in hay -> TemplateId.PHI4
             "falcon" in hay -> TemplateId.FALCON
+            // qwen35 is thinking-native (its template opens with <think>);
+            // older Qwen stay plain ChatML unless the raw template says otherwise.
+            "qwen35" in hay -> TemplateId.QWEN_THINK
             "qwen3" in hay || "qwen" in hay -> TemplateId.CHATML // Qwen family uses ChatML
             else -> TemplateId.CHATML
         }
@@ -66,6 +74,9 @@ object ChatTemplateRegistry {
             TemplateId.PHI4 -> renderPhi(systemPrompt, history, currentUserPrompt)
             TemplateId.FALCON -> renderFalcon(systemPrompt, history, currentUserPrompt)
             TemplateId.QWEN3 -> renderChatMl(systemPrompt, history, currentUserPrompt, prefillAssistant)
+            // Thinking models (Qwen3/qwen35 with <think> template): prefill the
+            // reasoning block like the template's add_generation_prompt branch.
+            TemplateId.QWEN_THINK -> renderChatMl(systemPrompt, history, currentUserPrompt, prefillAssistant ?: "<think>\n")
             TemplateId.CHATML, TemplateId.GENERIC -> renderChatMl(systemPrompt, history, currentUserPrompt, prefillAssistant)
         }
     }
