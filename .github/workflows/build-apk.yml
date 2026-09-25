@@ -35,6 +35,14 @@ jobs:
             -storepass android -keypass android -keyalg RSA -keysize 2048 \
             -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 
+      - name: Bootstrap wrapper jar and fix exec bit (repo ships scripts only)
+        run: |
+          chmod +x gradlew
+          curl -sL -o /tmp/gradle-9.3.1-bin.zip https://services.gradle.org/distributions/gradle-9.3.1-bin.zip
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/gradle-9.3.1-bin.zip').extractall('/tmp')"
+          /tmp/gradle-9.3.1/bin/gradle wrapper --gradle-version 9.3.1 --no-daemon -q
+          ls -la gradle/wrapper/
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
